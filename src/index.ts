@@ -1,4 +1,9 @@
 /**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * report-worker — Automated portfolio performance reports via Browser Rendering.
  *
  * Cron-triggered (06:00 UTC + 18:00 UTC):

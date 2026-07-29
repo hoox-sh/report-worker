@@ -1,4 +1,9 @@
 /**
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * Focused tests for the C-7 fix from the 2026-06-27 worker audit:
  *
  * C-7: the report-worker's buildReportHtml interpolated summary.topAsset
