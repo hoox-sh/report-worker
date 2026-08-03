@@ -1,5 +1,5 @@
 /**
- * Copyright (c) 2026 HOOX · HOOX · jango-blockchained
+ * Copyright (c) 2026 HOOX · HOOX · jango-blockchained (hoox-sh)
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -19,17 +19,17 @@ import {
   createLogger,
   withRequestLog,
   createInternalAuthMiddleware,
-} from "@jango-blockchained/hoox-shared/middleware";
-import { createRouter } from "@jango-blockchained/hoox-shared/router";
-import { healthCheck } from "@jango-blockchained/hoox-shared/health";
+} from "@hoox-sh/hoox-shared/middleware";
+import { createRouter } from "@hoox-sh/hoox-shared/router";
+import { healthCheck } from "@hoox-sh/hoox-shared/health";
 import {
   authenticatedServiceFetch,
   D1_READ_AUTH_KEY_FIELDS,
   TELEGRAM_ALERT_AUTH_KEY_FIELDS,
-} from "@jango-blockchained/hoox-shared/service-bindings";
-import { createCronHandler } from "@jango-blockchained/hoox-shared/cron-handler";
+} from "@hoox-sh/hoox-shared/service-bindings";
+import { createCronHandler } from "@hoox-sh/hoox-shared/cron-handler";
 
-import { createJsonResponse } from "@jango-blockchained/hoox-shared/errors";
+import { createJsonResponse } from "@hoox-sh/hoox-shared/errors";
 
 // --- Types ---
 
