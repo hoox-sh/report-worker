@@ -2,7 +2,7 @@
   "name": "report-worker",
   "version": "0.1.0",
   "private": true,
-  "description": "Automated PDF report generation via Cloudflare Browser Rendering",
+  "description": "HOOX report worker: twice-daily Browser Rendering PDFs to R2, metrics from analytics + D1, telegram delivery notices.",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -19,5 +19,9 @@
     "typescript": "^6.0.3",
     "wrangler": "^4.95.0"
   },
-  "author": "jango-blockchained (hoox-sh)"
+  "author": "jango-blockchained (hoox-sh)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hoox-sh/report-worker.git"
+  }
 }
