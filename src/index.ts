@@ -51,6 +51,8 @@ interface PortfolioSummary {
 // --- Constants ---
 
 const REPORTS_PREFIX = "reports/";
+/** Only allow safe path segments under reports/ (no traversal / absolute paths). */
+const SAFE_R2_KEY_RE = /^reports\/[A-Za-z0-9._-]+\.pdf$/;
 
 // --- Router Setup ---
 
@@ -111,6 +113,27 @@ export default {
   },
 };
 
+/**
+ * Build a path-safe R2 object key under reports/. Rejects traversal and
+ * non-PDF filenames so a future caller cannot write outside the prefix.
+ */
+export function buildReportObjectKey(now: number = Date.now()): string {
+  const day = new Date(now).toISOString().slice(0, 10); // YYYY-MM-DD
+  const key = `${REPORTS_PREFIX}daily-pnl-${day}-${now}.pdf`;
+  return assertSafeReportKey(key);
+}
+
+export function assertSafeReportKey(key: string): string {
+  if (typeof key !== "string" || !SAFE_R2_KEY_RE.test(key)) {
+    throw new Error(`Unsafe R2 report key rejected: ${String(key).slice(0, 80)}`);
+  }
+  // Defense-in-depth against encoded traversal that might slip past the regex
+  if (key.includes("..") || key.includes("\\") || key.startsWith("/")) {
+    throw new Error("Unsafe R2 report key rejected (path traversal)");
+  }
+  return key;
+}
+
 async function generateAndStoreReport(
   env: Env,
   ctx: ExecutionContext
@@ -125,14 +148,33 @@ async function generateAndStoreReport(
   try {
     const summary = await fetchPortfolioSummary(env);
     const html = buildReportHtml(summary);
-    const pdfBuffer = await generatePdf(html, env);
-    const key = `${REPORTS_PREFIX}daily-${Date.now()}.pdf`;
-    await env.REPORTS_BUCKET.put(key, pdfBuffer, {
-      httpMetadata: { contentType: "application/pdf" },
-    });
+
+    // Prefer Browser Rendering PDF → R2. If BROWSER is missing or PDF fails,
+    // fall back to a text-only Telegram summary so ops still get the numbers
+    // (docs: continuous operations without hard crashes).
+    let reportKey: string | null = null;
+    try {
+      if (!env.BROWSER) {
+        throw new Error("BROWSER binding not configured");
+      }
+      if (!env.REPORTS_BUCKET) {
+        throw new Error("REPORTS_BUCKET binding not configured");
+      }
+      const pdfBuffer = await generatePdf(html, env);
+      reportKey = buildReportObjectKey();
+      await env.REPORTS_BUCKET.put(reportKey, pdfBuffer, {
+        httpMetadata: { contentType: "application/pdf" },
+      });
+    } catch (pdfErr) {
+      logger.warn(
+        "PDF generation/storage unavailable — falling back to text summary",
+        { error: pdfErr instanceof Error ? pdfErr.message : String(pdfErr) }
+      );
+    }
+
     // Notification is fire-and-forget: don't block on it
     ctx.waitUntil(
-      sendNotification(env, key, summary).catch((err) =>
+      sendNotification(env, reportKey, summary).catch((err) =>
         logger.error("sendNotification failed", { error: String(err) })
       )
     );
@@ -149,6 +191,7 @@ export {
   fetchPortfolioSummary,
   buildReportHtml,
   generateAndStoreReport,
+  escapeHtml,
 };
 
 // --- Helpers ---
@@ -398,29 +441,55 @@ async function generatePdf(html: string, env: Env): Promise<ArrayBuffer> {
   }
 }
 
+/**
+ * Validate host used for download links. Rejects schemes, spaces, and
+ * path segments so notification URLs cannot be hijacked via env typo/injection.
+ */
+function safeReportHost(raw: unknown): string | null {
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const host = raw.trim().replace(/^https?:\/\//i, "").split("/")[0] ?? "";
+  // hostname or hostname:port only
+  if (!/^[A-Za-z0-9.-]+(?::\d{1,5})?$/.test(host)) return null;
+  return host;
+}
+
 async function sendNotification(
   env: Env,
-  key: string,
+  key: string | null,
   summary: PortfolioSummary
 ): Promise<void> {
   if (!env.TELEGRAM_SERVICE) return;
-  if (!env.REPORT_WORKER_URL) {
-    logger.warn("REPORT_WORKER_URL not configured — skipping notification");
-    return;
-  }
 
-  const signedUrl = `https://${env.REPORT_WORKER_URL}/${key}`;
-  const message = [
+  const lines = [
     `📊 *Daily Portfolio Report*`,
     ``,
-    `Total Value: $${summary.totalValue.toLocaleString()}`,
-    `Daily P&L: ${summary.dailyPnL >= 0 ? "+" : ""}$${summary.dailyPnL.toLocaleString()}`,
-    `Win Rate: ${summary.winRate}%`,
-    ``,
-    `[View Report](${signedUrl})`,
-  ].join("\n");
+    `Total Value: $${Number(summary.totalValue).toLocaleString()}`,
+    `Daily P&L: ${summary.dailyPnL >= 0 ? "+" : ""}$${Number(summary.dailyPnL).toLocaleString()}`,
+    `Win Rate: ${Number(summary.winRate)}%`,
+  ];
 
-  // Construct the payload expected by telegram-worker's /process endpoint
+  if (key) {
+    const safeKey = assertSafeReportKey(key);
+    const host = safeReportHost(env.REPORT_WORKER_URL);
+    if (host) {
+      // Encode each path segment; keep slash structure under reports/
+      const encodedPath = safeKey
+        .split("/")
+        .map((seg) => encodeURIComponent(seg))
+        .join("/");
+      lines.push(``, `[View Report](https://${host}/${encodedPath})`);
+    } else {
+      logger.warn(
+        "REPORT_WORKER_URL missing/invalid — sending metrics without download link"
+      );
+    }
+  } else {
+    lines.push(``, `_PDF unavailable — text summary only_`);
+  }
+
+  const message = lines.join("\n");
+
+  // Construct the payload expected by telegram-worker's /alert endpoint
   const payload = {
     payload: { message, chatId: undefined },
   };

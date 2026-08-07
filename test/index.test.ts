@@ -18,6 +18,8 @@ import worker, {
   fetchPortfolioSummary,
   buildReportHtml,
   generateAndStoreReport,
+  buildReportObjectKey,
+  assertSafeReportKey,
 } from "../src/index";
 import type { ExecutionContext } from "@cloudflare/workers-types";
 
@@ -29,6 +31,8 @@ function createMockContext(): ExecutionContext {
   } as unknown as ExecutionContext;
 }
 
+const TEST_INTERNAL_KEY = "test-internal-key";
+
 // Mock Env
 interface MockEnv {
   REPORTS_BUCKET?: R2Bucket;
@@ -38,6 +42,14 @@ interface MockEnv {
   INTERNAL_KEY_BINDING?: string;
   REPORT_WORKER_URL?: string;
   [key: string]: any;
+}
+
+/** Env base for service-binding calls (fail-closed auth requires a key). */
+function withAuth(overrides: Partial<MockEnv> = {}): MockEnv {
+  return {
+    INTERNAL_KEY_BINDING: TEST_INTERNAL_KEY,
+    ...overrides,
+  };
 }
 
 describe("Report Worker", () => {
@@ -1039,9 +1051,9 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         D1_SERVICE: mockD1Service as any,
-      };
+      });
 
       const summary = await fetchPortfolioSummary(env as any);
       expect(summary).toBeDefined();
@@ -1058,9 +1070,9 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         D1_SERVICE: mockD1Service as any,
-      };
+      });
 
       try {
         await fetchPortfolioSummary(env as any);
@@ -1103,9 +1115,9 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         D1_SERVICE: mockD1Service as any,
-      };
+      });
 
       const summary = await fetchPortfolioSummary(env as any);
       expect(summary.winRate).toBe(50); // 2 winning out of 4 positions
@@ -1143,9 +1155,9 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         D1_SERVICE: mockD1Service as any,
-      };
+      });
 
       const summary = await fetchPortfolioSummary(env as any);
       expect(summary.topAsset).toBe("BTC");
@@ -1162,10 +1174,10 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         TELEGRAM_SERVICE: mockTelegramService as any,
         REPORT_WORKER_URL: "report-worker.example.com",
-      };
+      });
 
       const summary = {
         totalValue: 10000,
@@ -1193,10 +1205,10 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         TELEGRAM_SERVICE: mockTelegramService as any,
         REPORT_WORKER_URL: "report-worker.example.com",
-      };
+      });
 
       const summary = {
         totalValue: 10000,
@@ -1208,14 +1220,19 @@ describe("Report Worker", () => {
       };
 
       await sendNotification(env as any, "reports/daily-123.pdf", summary);
-      // Notification should include the report URL
       expect(mockTelegramService.fetch).toHaveBeenCalled();
+      const msg =
+        capturedPayload?.payload?.message ??
+        capturedPayload?.message ??
+        JSON.stringify(capturedPayload);
+      expect(String(msg)).toContain("report-worker.example.com");
+      expect(String(msg)).toContain("reports");
     });
 
     it("handles missing TELEGRAM_SERVICE gracefully", async () => {
-      const env: MockEnv = {
+      const env = withAuth({
         // No TELEGRAM_SERVICE
-      };
+      });
 
       const summary = {
         totalValue: 10000,
@@ -1230,7 +1247,7 @@ describe("Report Worker", () => {
       await sendNotification(env as any, "reports/daily-123.pdf", summary);
     });
 
-    it("skips notification when REPORT_WORKER_URL is not configured", async () => {
+    it("still notifies with metrics when REPORT_WORKER_URL is not configured", async () => {
       const mockTelegramService = {
         fetch: mock(async () => {
           return new Response(JSON.stringify({ success: true }), {
@@ -1239,10 +1256,10 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         TELEGRAM_SERVICE: mockTelegramService as any,
-        // No REPORT_WORKER_URL
-      };
+        // No REPORT_WORKER_URL — metrics-only notification
+      });
 
       const summary = {
         totalValue: 10000,
@@ -1254,8 +1271,7 @@ describe("Report Worker", () => {
       };
 
       await sendNotification(env as any, "reports/daily-123.pdf", summary);
-      // Should skip notification, so fetch should NOT be called
-      expect(mockTelegramService.fetch).not.toHaveBeenCalled();
+      expect(mockTelegramService.fetch).toHaveBeenCalled();
     });
 
     it("includes portfolio metrics in notification", async () => {
@@ -1267,10 +1283,10 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         TELEGRAM_SERVICE: mockTelegramService as any,
         REPORT_WORKER_URL: "report-worker.example.com",
-      };
+      });
 
       const summary = {
         totalValue: 10000,
@@ -1294,10 +1310,10 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         TELEGRAM_SERVICE: mockTelegramService as any,
         REPORT_WORKER_URL: "report-worker.example.com",
-      };
+      });
 
       const summary = {
         totalValue: 10000,
@@ -1310,6 +1326,18 @@ describe("Report Worker", () => {
 
       // Should not throw even if service fails
       await sendNotification(env as any, "reports/daily-123.pdf", summary);
+    });
+
+    it("rejects unsafe R2 keys", () => {
+      expect(() => assertSafeReportKey("../etc/passwd.pdf")).toThrow();
+      expect(() => assertSafeReportKey("reports/../../secret.pdf")).toThrow();
+      expect(() => assertSafeReportKey("reports/daily.pdf.exe")).toThrow();
+      expect(assertSafeReportKey("reports/daily-pnl-2026-08-07-1.pdf")).toBe(
+        "reports/daily-pnl-2026-08-07-1.pdf"
+      );
+      expect(buildReportObjectKey(1_700_000_000_000)).toMatch(
+        /^reports\/daily-pnl-\d{4}-\d{2}-\d{2}-\d+\.pdf$/
+      );
     });
   });
 
@@ -1360,12 +1388,12 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         REPORTS_BUCKET: mockR2Bucket as any,
         D1_SERVICE: mockD1Service as any,
         TELEGRAM_SERVICE: mockTelegramService as any,
         BROWSER: mockPipelineBrowser(),
-      };
+      });
 
       const ctx = createMockContext();
 
@@ -1409,17 +1437,19 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         REPORTS_BUCKET: mockR2Bucket as any,
         D1_SERVICE: mockD1Service as any,
         BROWSER: mockPipelineBrowser(),
-      };
+      });
 
       const ctx = createMockContext();
 
       await generateAndStoreReport(env as any, ctx);
       expect(capturedKey).toBeDefined();
-      expect(capturedKey).toMatch(/^reports\/daily-\d+\.pdf$/);
+      expect(capturedKey).toMatch(
+        /^reports\/daily-pnl-\d{4}-\d{2}-\d{2}-\d+\.pdf$/
+      );
     });
 
     it("handles report generation errors gracefully", async () => {
@@ -1429,9 +1459,9 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         D1_SERVICE: mockD1Service as any,
-      };
+      });
 
       const ctx = createMockContext();
 
@@ -1479,11 +1509,11 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         REPORTS_BUCKET: mockR2Bucket as any,
         D1_SERVICE: mockD1Service as any,
         BROWSER: mockPipelineBrowser(),
-      };
+      });
 
       await generateAndStoreReport(env as any, ctx);
       // Report generation should complete without errors
@@ -1523,11 +1553,11 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         REPORTS_BUCKET: mockR2Bucket as any,
         D1_SERVICE: mockD1Service as any,
         BROWSER: mockPipelineBrowser(),
-      };
+      });
 
       const promises = [
         generateAndStoreReport(env as any, createMockContext()),
@@ -1583,16 +1613,71 @@ describe("Report Worker", () => {
         }),
       };
 
-      const env: MockEnv = {
+      const env = withAuth({
         REPORTS_BUCKET: mockR2Bucket as any,
         D1_SERVICE: mockD1Service as any,
         BROWSER: mockPipelineBrowser(),
-      };
+      });
 
       const ctx = createMockContext();
 
       await generateAndStoreReport(env as any, ctx);
       expect(mockR2Bucket.put).toHaveBeenCalled();
+    });
+
+    it("falls back to text notification when BROWSER is missing", async () => {
+      const mockTelegramService = {
+        fetch: mock(async () => {
+          return new Response(JSON.stringify({ success: true }), {
+            status: 200,
+          });
+        }),
+      };
+      const mockR2Bucket = {
+        put: mock(async () => ({ success: true })),
+      };
+      const mockD1Service = {
+        fetch: mock(async (path: string) => {
+          if (path.includes("/api/balances")) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                totalBalance: 1000,
+                balances: [],
+              }),
+              { status: 200 }
+            );
+          }
+          if (path.includes("/api/positions")) {
+            return new Response(
+              JSON.stringify({ success: true, positions: [] }),
+              { status: 200 }
+            );
+          }
+          return new Response(null, { status: 404 });
+        }),
+      };
+
+      const mockWaitUntil = mock((p: Promise<unknown>) => p);
+      const ctx = {
+        waitUntil: mockWaitUntil,
+        passThroughOnException: mock(() => {}),
+      } as unknown as ExecutionContext;
+
+      const env = withAuth({
+        REPORTS_BUCKET: mockR2Bucket as any,
+        D1_SERVICE: mockD1Service as any,
+        TELEGRAM_SERVICE: mockTelegramService as any,
+        REPORT_WORKER_URL: "report-worker.example.com",
+        // No BROWSER
+      });
+
+      await generateAndStoreReport(env as any, ctx);
+      expect(mockR2Bucket.put).not.toHaveBeenCalled();
+      // waitUntil schedules notification; flush it
+      const pending = mockWaitUntil.mock.calls.map((c) => c[0]);
+      await Promise.all(pending);
+      expect(mockTelegramService.fetch).toHaveBeenCalled();
     });
   });
 });

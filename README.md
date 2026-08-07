@@ -13,7 +13,7 @@
 
 The report-worker generates PDF portfolio reports using Cloudflare Browser Rendering — a headless Chromium instance launched and controlled from within a V8 isolate. On a scheduled cron trigger (twice-daily configurable interval), it fetches aggregated trade metrics from the [`analytics-worker`](https://github.com/hoox-sh/analytics-worker) and the [`d1-worker`](https://github.com/hoox-sh/d1-worker), renders them as a styled HTML page, and converts the page to PDF via the Browser Rendering API.
 
-Generated reports are persisted to R2 (`trade-reports` bucket) under keyed paths (`reports/daily-{timestamp}.pdf`). On successful generation, the worker fires a notification through the [`telegram-worker`](https://github.com/hoox-sh/telegram-worker) with a download link. The dashboard reads report manifests from R2 for user-facing report history.
+Generated reports are persisted to R2 (`trade-reports` bucket) under path-safe keys (`reports/daily-pnl-{YYYY-MM-DD}-{timestamp}.pdf`). Keys are validated against a strict regex (no path traversal). On successful generation, the worker fires a notification through the [`telegram-worker`](https://github.com/hoox-sh/telegram-worker) with a download link. If Browser Rendering or R2 is unavailable, the worker **falls back** to a text-only Telegram summary so ops still receive metrics. HTML template fields from D1 are HTML-escaped before PDF render. The dashboard reads report manifests from R2 for user-facing report history.
 
 ### Role in the Mesh
 
@@ -38,12 +38,11 @@ d1-worker ─────────┼──► report-worker ──► Browse
 ### Data Flow
 
 ```
-1. Cron tick → collect metrics from analytics-worker + d1-worker
-2. Render HTML template with trade history, PnL, Sharpe, drawdown
-3. Launch headless Chromium via Browser Rendering API
-4. Navigate to generated HTML → `page.pdf()` → Buffer
-5. Upload to R2: reports/daily-{timestamp}.pdf
-6. Notify telegram-worker: "📊 Daily report ready"
+1. Cron tick / GET /report → collect metrics from d1-worker
+2. Render HTML template (HTML-escaped fields) with portfolio summary
+3. Browser Rendering binding → PDF buffer (or text-only Telegram fallback)
+4. Upload to R2: reports/daily-pnl-{YYYY-MM-DD}-{timestamp}.pdf
+5. Notify telegram-worker with metrics + optional download link
 ```
 
 ### Infrastructure
