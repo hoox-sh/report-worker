@@ -1679,5 +1679,71 @@ describe("Report Worker", () => {
       await Promise.all(pending);
       expect(mockTelegramService.fetch).toHaveBeenCalled();
     });
+
+    it("falls back when BROWSER present but REPORTS_BUCKET missing", async () => {
+      const mockD1Service = {
+        fetch: mock(async (path: string) => {
+          if (path.includes("/api/balances")) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                totalBalance: 1000,
+                balances: [{ exchange: "binance", asset: "BTC", total: 1 }],
+              }),
+              { status: 200 }
+            );
+          }
+          if (path.includes("/api/positions")) {
+            return new Response(
+              JSON.stringify({ success: true, positions: [] }),
+              { status: 200 }
+            );
+          }
+          return new Response(null, { status: 404 });
+        }),
+      };
+      const mockTelegramService = {
+        fetch: mock(async () => new Response("{}", { status: 200 })),
+      };
+      const mockWaitUntil = mock((p: Promise<unknown>) => p);
+      const ctx = {
+        waitUntil: mockWaitUntil,
+        passThroughOnException: mock(() => {}),
+      } as unknown as ExecutionContext;
+
+      const env = withAuth({
+        BROWSER: mockPipelineBrowser(),
+        // REPORTS_BUCKET intentionally omitted
+        D1_SERVICE: mockD1Service as any,
+        TELEGRAM_SERVICE: mockTelegramService as any,
+        REPORT_WORKER_URL: "report-worker.example.com",
+      });
+
+      await generateAndStoreReport(env as any, ctx);
+      const pending = mockWaitUntil.mock.calls.map((c) => c[0]);
+      await Promise.all(pending);
+      expect(mockTelegramService.fetch).toHaveBeenCalled();
+    });
+  });
+
+  describe("scheduled cron handler", () => {
+    it("scheduled() invokes report generation via waitUntil", async () => {
+      const waitUntil = mock((p: Promise<unknown>) => p);
+      const ctx = {
+        waitUntil,
+        passThroughOnException: mock(() => {}),
+      } as unknown as ExecutionContext;
+      const env = withAuth({
+        // No D1 → generateAndStoreReport returns early after warn
+      });
+      await (await import("../src/index")).default.scheduled(
+        { cron: "0 6 * * *", scheduledTime: Date.now(), type: "scheduled" } as any,
+        env as any,
+        ctx
+      );
+      expect(waitUntil).toHaveBeenCalled();
+      const pending = waitUntil.mock.calls.map((c) => c[0]);
+      await Promise.all(pending);
+    });
   });
 });
