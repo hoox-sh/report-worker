@@ -1,87 +1,23 @@
 {
   "display_name": "Report Worker",
-  "description": "Automated portfolio performance reports via Browser Rendering",
+  "description": "Schedule/PDF options live in wrangler (crons + Browser Rendering). Only optional Telegram chat override is operator-set.",
   "sections": {
-    "schedule": {
-      "title": "Schedule",
-      "description": "Cron schedule for automated report generation",
-      "icon": "clock",
-      "priority": 10,
-      "fields": {
-        "enabled": true,
-        "cron_morning": "0 8 * * *",
-        "cron_evening": "0 18 * * *",
-      },
-      "descriptions": {
-        "enabled": "Enable or disable automated report generation entirely.",
-        "cron_morning": "Morning report generation time (UTC). Generates PDF and sends Telegram notification.",
-        "cron_evening": "Evening report generation time (UTC). Generates PDF and sends Telegram notification.",
-      },
-    },
-    "rendering": {
-      "title": "PDF Rendering",
-      "description": "Cloudflare Browser Rendering configuration for PDF generation",
-      "icon": "file-text",
-      "priority": 20,
-      "fields": {
-        "page_format": "A4",
-        "print_background": true,
-        "margin_top": "1cm",
-        "margin_bottom": "1cm",
-      },
-      "options": {
-        "page_format": ["A4", "Letter", "Legal"],
-      },
-      "descriptions": {
-        "page_format": "PDF page format for generated reports.",
-        "print_background": "Include background colors and images in the PDF output.",
-        "margin_top": "Top margin for the PDF report page.",
-        "margin_bottom": "Bottom margin for the PDF report page.",
-      },
-    },
-    "storage": {
-      "title": "Report Storage",
-      "description": "R2 bucket configuration for storing generated PDF reports",
-      "icon": "archive",
-      "priority": 30,
-      "fields": {
-        "bucket_name": "trade-reports",
-        "retention_days": 90,
-      },
-      "options": {
-        "retention_days": [7, 30, 60, 90, 180, 365],
-      },
-      "descriptions": {
-        "bucket_name": "R2 bucket where generated PDF reports are stored.",
-        "retention_days": "Number of days to retain generated reports before automatic cleanup.",
-      },
-    },
     "delivery": {
-      "title": "Telegram Delivery",
-      "description": "Optional chat override for report PDFs. Default: omit chatId so telegram-worker uses TG_CHAT_ID_BINDING + AUTHORIZED_CHAT_IDS allowlist.",
+      "title": "Telegram Delivery (CLI)",
+      "description": "Default: omit chatId (telegram-worker TG_CHAT_ID_BINDING + allowlist). Optional override secret only.",
       "icon": "send",
-      "priority": 35,
+      "priority": 10,
       "fields": {
         "telegram_chat_id": "Requires CLI Setup",
       },
       "descriptions": {
-        "telegram_chat_id": "Optional REPORT_TELEGRAM_CHAT_ID secret. Leave unset to use telegram-worker default. Run: hoox secrets set report-worker REPORT_TELEGRAM_CHAT_ID",
+        "telegram_chat_id": "REPORT_TELEGRAM_CHAT_ID — leave unset unless reports must go to a non-default chat.",
       },
       "secrets": {
         "telegram_chat_id": true,
       },
       "secret_commands": {
         "telegram_chat_id": "hoox secrets set report-worker REPORT_TELEGRAM_CHAT_ID",
-      },
-    },
-    "endpoints": {
-      "title": "Available Endpoints",
-      "description": "REST endpoints exposed by the report-worker (documentation only — not written to CONFIG_KV)",
-      "icon": "globe",
-      "priority": 40,
-      "fields": {
-        "GET /health": "Health check endpoint returning worker status",
-        "GET /report": "Trigger an immediate report generation (returns 202 and generates in background)",
       },
     },
   },
