@@ -153,7 +153,11 @@ export function rejectOversizedContentLength(
 
 export default {
   fetch: withRequestLog(
-    (request: Request, env: Env, ctx: ExecutionContext) => {
+    async (
+      request: Request,
+      env: Env,
+      ctx: ExecutionContext
+    ): Promise<Response> => {
       const oversized = rejectOversizedContentLength(request);
       if (oversized) return oversized;
       return router.handle(request, env, ctx);
