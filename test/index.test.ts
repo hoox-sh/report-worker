@@ -20,6 +20,11 @@ import worker, {
   generateAndStoreReport,
   buildReportObjectKey,
   assertSafeReportKey,
+  rejectOversizedContentLength,
+  MAX_REQUEST_BODY_BYTES,
+  isValidTelegramChatId,
+  resolveOptionalReportChatId,
+  safeReportHost,
 } from "../src/index";
 import type { ExecutionContext } from "@cloudflare/workers-types";
 
@@ -41,6 +46,7 @@ interface MockEnv {
   BROWSER?: any;
   INTERNAL_KEY_BINDING?: string;
   REPORT_WORKER_URL?: string;
+  REPORT_TELEGRAM_CHAT_ID?: string;
   [key: string]: any;
 }
 
@@ -210,6 +216,87 @@ describe("Report Worker", () => {
 
       await worker.fetch(request, env, ctx);
       expect(mockWaitUntil).toHaveBeenCalled();
+    });
+
+    it("GET /report rejects missing X-Internal-Auth-Key (401)", async () => {
+      const request = new Request("https://example.com/report");
+      const env = authedReportEnv();
+      const ctx = createMockContext();
+
+      const response = await worker.fetch(request, env, ctx);
+      expect(response.status).toBe(401);
+      const body = (await response.json()) as Record<string, unknown>;
+      expect(body.success).toBe(false);
+    });
+
+    it("GET /report rejects wrong X-Internal-Auth-Key (401)", async () => {
+      const request = new Request("https://example.com/report", {
+        headers: { "X-Internal-Auth-Key": "wrong-key" },
+      });
+      const env = authedReportEnv();
+      const ctx = createMockContext();
+
+      const response = await worker.fetch(request, env, ctx);
+      expect(response.status).toBe(401);
+    });
+
+    it("GET /report fails closed when INTERNAL_KEY_BINDING unset (401)", async () => {
+      const request = new Request("https://example.com/report", {
+        headers: { "X-Internal-Auth-Key": "anything" },
+      });
+      // No INTERNAL_KEY_BINDING — fail-closed
+      const env: MockEnv = {};
+      const ctx = createMockContext();
+
+      const response = await worker.fetch(request, env, ctx);
+      expect(response.status).toBe(401);
+      const body = (await response.json()) as Record<string, unknown>;
+      expect(body.success).toBe(false);
+      expect(String(body.error)).toMatch(/not configured|Unauthorized/i);
+    });
+  });
+
+  describe("Body size / Content-Length guard", () => {
+    it("rejectOversizedContentLength ignores GET", () => {
+      const req = new Request("https://example.com/report", {
+        method: "GET",
+        headers: { "Content-Length": String(MAX_REQUEST_BODY_BYTES + 1) },
+      });
+      expect(rejectOversizedContentLength(req)).toBeNull();
+    });
+
+    it("rejectOversizedContentLength returns 413 for oversized POST", () => {
+      const req = new Request("https://example.com/report", {
+        method: "POST",
+        headers: { "Content-Length": String(MAX_REQUEST_BODY_BYTES + 1) },
+        body: "x",
+      });
+      const res = rejectOversizedContentLength(req);
+      expect(res).not.toBeNull();
+      expect(res!.status).toBe(413);
+    });
+
+    it("fetch returns 413 for oversized Content-Length on POST", async () => {
+      const request = new Request("https://example.com/report", {
+        method: "POST",
+        headers: {
+          "Content-Length": String(MAX_REQUEST_BODY_BYTES + 100),
+          "X-Internal-Auth-Key": TEST_INTERNAL_KEY,
+        },
+        body: "x".repeat(10),
+      });
+      // Override Content-Length after construction (fetch may recompute)
+      const headers = new Headers(request.headers);
+      headers.set("Content-Length", String(MAX_REQUEST_BODY_BYTES + 100));
+      const oversized = new Request(request.url, {
+        method: "POST",
+        headers,
+        // body omitted so we only test the Content-Length gate
+      });
+      const env = withAuth();
+      const ctx = createMockContext();
+      const response = await worker.fetch(oversized, env, ctx);
+      expect(response.status).toBe(413);
     });
   });
 
@@ -1332,12 +1419,152 @@ describe("Report Worker", () => {
       expect(() => assertSafeReportKey("../etc/passwd.pdf")).toThrow();
       expect(() => assertSafeReportKey("reports/../../secret.pdf")).toThrow();
       expect(() => assertSafeReportKey("reports/daily.pdf.exe")).toThrow();
+      expect(() => assertSafeReportKey("/reports/daily.pdf")).toThrow();
+      expect(() => assertSafeReportKey("reports/../x.pdf")).toThrow();
+      expect(() => assertSafeReportKey("reports/sub/dir.pdf")).toThrow();
       expect(assertSafeReportKey("reports/daily-pnl-2026-08-07-1.pdf")).toBe(
         "reports/daily-pnl-2026-08-07-1.pdf"
       );
       expect(buildReportObjectKey(1_700_000_000_000)).toMatch(
         /^reports\/daily-pnl-\d{4}-\d{2}-\d{2}-\d+\.pdf$/
       );
+    });
+
+    it("omits chatId by default (telegram-worker default + allowlist)", async () => {
+      let capturedPayload: any;
+      const mockTelegramService = {
+        fetch: mock(async (_url: string, options: any) => {
+          if (options?.body) {
+            capturedPayload = JSON.parse(options.body);
+          }
+          return new Response(JSON.stringify({ success: true }), {
+            status: 200,
+          });
+        }),
+      };
+
+      const env = withAuth({
+        TELEGRAM_SERVICE: mockTelegramService as any,
+        REPORT_WORKER_URL: "report-worker.example.com",
+      });
+
+      const summary = {
+        totalValue: 10000,
+        dailyPnL: 500,
+        totalPnL: 2000,
+        openPositions: 5,
+        winRate: 75,
+        topAsset: "BTC",
+      };
+
+      await sendNotification(env as any, "reports/daily-123.pdf", summary);
+      expect(mockTelegramService.fetch).toHaveBeenCalled();
+      const inner = capturedPayload?.payload ?? capturedPayload;
+      expect(inner).toBeDefined();
+      expect(inner.message).toBeDefined();
+      // chatId must be omitted so telegram-worker uses TG_CHAT_ID_BINDING
+      expect(inner.chatId).toBeUndefined();
+      expect("chatId" in inner).toBe(false);
+    });
+
+    it("passes chatId only when REPORT_TELEGRAM_CHAT_ID is format-valid", async () => {
+      let capturedPayload: any;
+      const mockTelegramService = {
+        fetch: mock(async (_url: string, options: any) => {
+          if (options?.body) {
+            capturedPayload = JSON.parse(options.body);
+          }
+          return new Response(JSON.stringify({ success: true }), {
+            status: 200,
+          });
+        }),
+      };
+
+      const env = withAuth({
+        TELEGRAM_SERVICE: mockTelegramService as any,
+        REPORT_WORKER_URL: "report-worker.example.com",
+        REPORT_TELEGRAM_CHAT_ID: "-1001234567890",
+      });
+
+      const summary = {
+        totalValue: 10000,
+        dailyPnL: 500,
+        totalPnL: 2000,
+        openPositions: 5,
+        winRate: 75,
+        topAsset: "BTC",
+      };
+
+      await sendNotification(env as any, "reports/daily-123.pdf", summary);
+      const inner = capturedPayload?.payload ?? capturedPayload;
+      expect(inner.chatId).toBe("-1001234567890");
+    });
+
+    it("omits chatId when REPORT_TELEGRAM_CHAT_ID is invalid", async () => {
+      let capturedPayload: any;
+      const mockTelegramService = {
+        fetch: mock(async (_url: string, options: any) => {
+          if (options?.body) {
+            capturedPayload = JSON.parse(options.body);
+          }
+          return new Response(JSON.stringify({ success: true }), {
+            status: 200,
+          });
+        }),
+      };
+
+      const env = withAuth({
+        TELEGRAM_SERVICE: mockTelegramService as any,
+        REPORT_TELEGRAM_CHAT_ID: "../evil",
+      });
+
+      const summary = {
+        totalValue: 10000,
+        dailyPnL: 500,
+        totalPnL: 2000,
+        openPositions: 5,
+        winRate: 75,
+        topAsset: "BTC",
+      };
+
+      await sendNotification(env as any, "reports/daily-123.pdf", summary);
+      const inner = capturedPayload?.payload ?? capturedPayload;
+      expect(inner.chatId).toBeUndefined();
+    });
+  });
+
+  describe("Telegram chatId + host validation helpers", () => {
+    it("isValidTelegramChatId accepts user and supergroup ids", () => {
+      expect(isValidTelegramChatId("123456789")).toBe(true);
+      expect(isValidTelegramChatId("-1001234567890")).toBe(true);
+      expect(isValidTelegramChatId(12345)).toBe(true);
+    });
+
+    it("isValidTelegramChatId rejects injection / non-numeric", () => {
+      expect(isValidTelegramChatId("../x")).toBe(false);
+      expect(isValidTelegramChatId("abc")).toBe(false);
+      expect(isValidTelegramChatId("")).toBe(false);
+      expect(isValidTelegramChatId(null)).toBe(false);
+      expect(isValidTelegramChatId("1.5")).toBe(false);
+      expect(isValidTelegramChatId("1e10")).toBe(false);
+    });
+
+    it("resolveOptionalReportChatId returns undefined when unset", () => {
+      expect(resolveOptionalReportChatId({} as any)).toBeUndefined();
+      expect(
+        resolveOptionalReportChatId({ REPORT_TELEGRAM_CHAT_ID: "" } as any)
+      ).toBeUndefined();
+    });
+
+    it("safeReportHost rejects schemes, paths, and spaces", () => {
+      expect(safeReportHost("reports.example.com")).toBe("reports.example.com");
+      expect(safeReportHost("https://reports.example.com/path")).toBe(
+        "reports.example.com"
+      );
+      expect(safeReportHost("evil.com/../../x")).toBe("evil.com");
+      expect(safeReportHost("not a host")).toBeNull();
+      expect(safeReportHost("")).toBeNull();
+      expect(safeReportHost("javascript:alert(1)")).toBeNull();
     });
   });
 

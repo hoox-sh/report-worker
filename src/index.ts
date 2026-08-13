@@ -6,12 +6,20 @@
 /**
  * report-worker — Automated portfolio performance reports via Browser Rendering.
  *
- * Cron-triggered (06:00 UTC + 18:00 UTC):
- * 1. Fetches portfolio data from D1 (via d1-worker service binding)
- * 2. Renders HTML report page
- * 3. Generates PDF via Cloudflare Browser Rendering REST API
- * 4. Stores PDF in R2 bucket
- * 5. Sends notification link via telegram-worker
+ * Cron-triggered (twice daily, see wrangler triggers):
+ * 1. Fetches portfolio data from D1 via fixed named endpoints
+ *    (`GET /api/balances`, `GET /api/positions`) — never free-form `/query`
+ * 2. Renders HTML report page (HTML-escaped string fields)
+ * 3. Generates PDF via Cloudflare Browser Rendering binding
+ * 4. Stores PDF in R2 under path-safe keys (`SAFE_R2_KEY_RE`)
+ * 5. Notifies via telegram-worker `/alert` (default chatId unless optional
+ *    `REPORT_TELEGRAM_CHAT_ID` is set and format-valid)
+ *
+ * Security:
+ * - Internal auth on `GET /report` is fail-closed (`createInternalAuthMiddleware`)
+ * - Background work always uses `safeWaitUntil` (never bare `ctx.waitUntil`)
+ * - Logs never include raw secrets or full error objects that might carry headers
+ * - Request bodies (if any method declares Content-Length) are size-capped
  */
 
 import { ScheduledEvent } from "@cloudflare/workers-types";
@@ -21,7 +29,10 @@ import {
   createInternalAuthMiddleware,
   safeWaitUntil,
 } from "@hoox-sh/hoox-shared/middleware";
-import { createRouter } from "@hoox-sh/hoox-shared/router";
+import {
+  createRouter,
+  type MiddlewareHandler,
+} from "@hoox-sh/hoox-shared/router";
 import { healthCheck } from "@hoox-sh/hoox-shared/health";
 import {
   authenticatedServiceFetch,
@@ -37,6 +48,8 @@ import { createJsonResponse } from "@hoox-sh/hoox-shared/errors";
 const logger = createLogger({ service: "report-worker" });
 
 export interface Env extends Cloudflare.Env {
+  /** Optional override destination for report Telegram alerts. Format-validated. */
+  REPORT_TELEGRAM_CHAT_ID?: string;
   [key: string]: unknown;
 }
 
@@ -55,10 +68,23 @@ const REPORTS_PREFIX = "reports/";
 /** Only allow safe path segments under reports/ (no traversal / absolute paths). */
 const SAFE_R2_KEY_RE = /^reports\/[A-Za-z0-9._-]+\.pdf$/;
 
+/**
+ * Hard cap for declared request bodies. report-worker has no POST handlers that
+ * parse JSON today; this still rejects oversized Content-Length early so a
+ * future POST or mis-routed method cannot force large body buffering.
+ */
+export const MAX_REQUEST_BODY_BYTES = 64 * 1024; // 64 KiB
+
+/** Telegram chat IDs: optional leading minus + digits (user / supergroup). */
+const SAFE_TELEGRAM_CHAT_ID_RE = /^-?\d{1,20}$/;
+
 // --- Router Setup ---
 
 const router = createRouter<Env>();
-const requireAuth = createInternalAuthMiddleware();
+// Cast: createInternalAuthMiddleware returns MiddlewareHandler for InternalAuthEnv;
+// Env includes INTERNAL_KEY_BINDING (fail-closed when unset).
+const requireAuth =
+  createInternalAuthMiddleware() as unknown as MiddlewareHandler<Env>;
 
 router.get(
   "/health",
@@ -69,9 +95,11 @@ router.get(
 
 router.get(
   "/report",
-  async (request: Request, env: Env, ctx: ExecutionContext) => {
+  async (_request: Request, env: Env, ctx: ExecutionContext) => {
     safeWaitUntil(ctx, generateAndStoreReport(env, ctx), (err) =>
-      logger.error("generateAndStoreReport failed", { error: String(err) })
+      logger.error("generateAndStoreReport failed", {
+        error: err instanceof Error ? err.message : String(err),
+      })
     );
     return createJsonResponse(
       { success: true, message: "Report generation started" },
@@ -88,14 +116,46 @@ const cronHandler = createCronHandler<Env>({
   logger,
   handler: async (_event: ScheduledEvent, env: Env, ctx: ExecutionContext) => {
     safeWaitUntil(ctx, generateAndStoreReport(env, ctx), (err) =>
-      logger.error("generateAndStoreReport failed", { error: String(err) })
+      logger.error("generateAndStoreReport failed", {
+        error: err instanceof Error ? err.message : String(err),
+      })
     );
   },
 });
 
+/**
+ * Early Content-Length reject for non-idempotent methods. Does not stream the
+ * body; trusts Content-Length only as a cheap gate (handlers that parse bodies
+ * later must re-enforce with a hard read cap).
+ */
+export function rejectOversizedContentLength(
+  request: Request,
+  maxBytes: number = MAX_REQUEST_BODY_BYTES
+): Response | null {
+  const method = request.method.toUpperCase();
+  if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
+    return null;
+  }
+  const contentLength = request.headers.get("Content-Length");
+  if (contentLength === null) return null;
+  const size = Number.parseInt(contentLength, 10);
+  if (!Number.isFinite(size) || size < 0 || size > maxBytes) {
+    return createJsonResponse(
+      {
+        success: false,
+        error: `Request body too large (max ${maxBytes} bytes)`,
+      },
+      413
+    );
+  }
+  return null;
+}
+
 export default {
   fetch: withRequestLog(
     (request: Request, env: Env, ctx: ExecutionContext) => {
+      const oversized = rejectOversizedContentLength(request);
+      if (oversized) return oversized;
       return router.handle(request, env, ctx);
     },
     { service: "report-worker", module: "router" }
@@ -171,10 +231,14 @@ async function generateAndStoreReport(
 
     // Notification is fire-and-forget: don't block on it
     safeWaitUntil(ctx, sendNotification(env, reportKey, summary), (err) =>
-      logger.error("sendNotification failed", { error: String(err) })
+      logger.error("sendNotification failed", {
+        error: err instanceof Error ? err.message : String(err),
+      })
     );
   } catch (err) {
-    logger.error("Failed to generate report", { error: err });
+    logger.error("Failed to generate report", {
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -187,6 +251,7 @@ export {
   buildReportHtml,
   generateAndStoreReport,
   escapeHtml,
+  safeReportHost,
 };
 
 // --- Helpers ---
@@ -274,7 +339,9 @@ async function fetchPortfolioSummary(env: Env): Promise<PortfolioSummary> {
       topAsset,
     };
   } catch (err) {
-    logger.error("Failed to fetch portfolio summary from D1", { error: err });
+    logger.error("Failed to fetch portfolio summary from D1", {
+      error: err instanceof Error ? err.message : String(err),
+    });
     throw err;
   }
 }
@@ -448,6 +515,49 @@ function safeReportHost(raw: unknown): string | null {
   return host;
 }
 
+/**
+ * Validate Telegram chatId format (digits, optional leading minus).
+ * Does not check allowlists — that is telegram-worker's responsibility.
+ */
+export function isValidTelegramChatId(raw: unknown): boolean {
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw) || !Number.isInteger(raw)) return false;
+    return SAFE_TELEGRAM_CHAT_ID_RE.test(String(raw));
+  }
+  if (typeof raw !== "string") return false;
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 32) return false;
+  if (
+    trimmed.includes("..") ||
+    trimmed.includes("/") ||
+    trimmed.includes("\\") ||
+    trimmed.includes("\0")
+  ) {
+    return false;
+  }
+  return SAFE_TELEGRAM_CHAT_ID_RE.test(trimmed);
+}
+
+/**
+ * Optional report-specific chat override from env.
+ *
+ * Default policy: **omit chatId** so telegram-worker uses `TG_CHAT_ID_BINDING`
+ * and its outbound allowlist (`AUTHORIZED_CHAT_IDS` / default-only path).
+ * When `REPORT_TELEGRAM_CHAT_ID` is set, it must pass format validation or we
+ * fall back to omitting chatId (and log a warning).
+ */
+export function resolveOptionalReportChatId(env: Env): string | undefined {
+  const raw = env.REPORT_TELEGRAM_CHAT_ID;
+  if (raw === undefined || raw === null || raw === "") return undefined;
+  if (!isValidTelegramChatId(raw)) {
+    logger.warn(
+      "REPORT_TELEGRAM_CHAT_ID invalid format — omitting chatId (telegram-worker default)"
+    );
+    return undefined;
+  }
+  return typeof raw === "string" ? raw.trim() : String(raw);
+}
+
 async function sendNotification(
   env: Env,
   key: string | null,
@@ -484,10 +594,14 @@ async function sendNotification(
 
   const message = lines.join("\n");
 
-  // Construct the payload expected by telegram-worker's /alert endpoint
-  const payload = {
-    payload: { message, chatId: undefined },
-  };
+  // Prefer omitting chatId so telegram-worker uses TG_CHAT_ID_BINDING + allowlist.
+  // Only pass chatId when REPORT_TELEGRAM_CHAT_ID is set and format-valid.
+  const chatId = resolveOptionalReportChatId(env);
+  const inner: { message: string; chatId?: string } = { message };
+  if (chatId !== undefined) {
+    inner.chatId = chatId;
+  }
+  const payload = { payload: inner };
 
   await authenticatedServiceFetch(
     env.TELEGRAM_SERVICE,
