@@ -56,9 +56,27 @@
         "retention_days": "Number of days to retain generated reports before automatic cleanup.",
       },
     },
+    "delivery": {
+      "title": "Telegram Delivery",
+      "description": "Optional chat override for report PDFs. Default: omit chatId so telegram-worker uses TG_CHAT_ID_BINDING + AUTHORIZED_CHAT_IDS allowlist.",
+      "icon": "send",
+      "priority": 35,
+      "fields": {
+        "telegram_chat_id": "Requires CLI Setup",
+      },
+      "descriptions": {
+        "telegram_chat_id": "Optional REPORT_TELEGRAM_CHAT_ID secret. Leave unset to use telegram-worker default. Run: hoox secrets set report-worker REPORT_TELEGRAM_CHAT_ID",
+      },
+      "secrets": {
+        "telegram_chat_id": true,
+      },
+      "secret_commands": {
+        "telegram_chat_id": "hoox secrets set report-worker REPORT_TELEGRAM_CHAT_ID",
+      },
+    },
     "endpoints": {
       "title": "Available Endpoints",
-      "description": "REST endpoints exposed by the report-worker",
+      "description": "REST endpoints exposed by the report-worker (documentation only — not written to CONFIG_KV)",
       "icon": "globe",
       "priority": 40,
       "fields": {
