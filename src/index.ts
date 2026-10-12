@@ -42,6 +42,7 @@ import {
 import { createCronHandler } from "@hoox-sh/hoox-shared/cron-handler";
 
 import { createJsonResponse } from "@hoox-sh/hoox-shared/errors";
+import { effectiveTenantId, type TenantEnv } from "@hoox-sh/hoox-shared/tenant";
 
 // --- Types ---
 
@@ -50,6 +51,9 @@ const logger = createLogger({ service: "report-worker" });
 export interface Env extends Cloudflare.Env {
   /** Optional override destination for report Telegram alerts. Format-validated. */
   REPORT_TELEGRAM_CHAT_ID?: string;
+  /** Opt-in tenant isolation (see @hoox-sh/hoox-shared/tenant). Absent = self-host default. */
+  TENANT_ID?: string;
+  TENANT_MODE?: string;
   [key: string]: unknown;
 }
 
@@ -177,16 +181,25 @@ export default {
 /**
  * Build a path-safe R2 object key under reports/. Rejects traversal and
  * non-PDF filenames so a future caller cannot write outside the prefix.
+ * Opt-in tenant isolation infixes `t-<id>-` into the filename (regex-safe,
+ * identity when TENANT_MODE is off).
  */
-export function buildReportObjectKey(now: number = Date.now()): string {
+export function buildReportObjectKey(
+  now: number = Date.now(),
+  env?: TenantEnv
+): string {
   const day = new Date(now).toISOString().slice(0, 10); // YYYY-MM-DD
-  const key = `${REPORTS_PREFIX}daily-pnl-${day}-${now}.pdf`;
+  const tenantId = env ? effectiveTenantId(env) : null;
+  const tenantSeg = tenantId ? `t-${tenantId}-` : "";
+  const key = `${REPORTS_PREFIX}${tenantSeg}daily-pnl-${day}-${now}.pdf`;
   return assertSafeReportKey(key);
 }
 
 export function assertSafeReportKey(key: string): string {
   if (typeof key !== "string" || !SAFE_R2_KEY_RE.test(key)) {
-    throw new Error(`Unsafe R2 report key rejected: ${String(key).slice(0, 80)}`);
+    throw new Error(
+      `Unsafe R2 report key rejected: ${String(key).slice(0, 80)}`
+    );
   }
   // Defense-in-depth against encoded traversal that might slip past the regex
   if (key.includes("..") || key.includes("\\") || key.startsWith("/")) {
@@ -222,7 +235,7 @@ async function generateAndStoreReport(
         throw new Error("REPORTS_BUCKET binding not configured");
       }
       const pdfBuffer = await generatePdf(html, env);
-      reportKey = buildReportObjectKey();
+      reportKey = buildReportObjectKey(Date.now(), env);
       await env.REPORTS_BUCKET.put(reportKey, pdfBuffer, {
         httpMetadata: { contentType: "application/pdf" },
       });
@@ -513,7 +526,11 @@ async function generatePdf(html: string, env: Env): Promise<ArrayBuffer> {
  */
 function safeReportHost(raw: unknown): string | null {
   if (typeof raw !== "string" || !raw.trim()) return null;
-  const host = raw.trim().replace(/^https?:\/\//i, "").split("/")[0] ?? "";
+  const host =
+    raw
+      .trim()
+      .replace(/^https?:\/\//i, "")
+      .split("/")[0] ?? "";
   // hostname or hostname:port only
   if (!/^[A-Za-z0-9.-]+(?::\d{1,5})?$/.test(host)) return null;
   return host;
