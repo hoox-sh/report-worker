@@ -468,7 +468,7 @@ async function generatePdf(html: string, env: Env): Promise<ArrayBuffer> {
     );
   }
 
-  const browser = env.BROWSER as {
+  const browser = env.BROWSER as unknown as {
     quickAction: (
       action: string,
       params: Record<string, unknown>
